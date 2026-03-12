@@ -22,6 +22,8 @@ use std::{collections::HashMap, str::FromStr};
 
 pub type PackedGroth16Proof = [BigUint; 8];
 
+/// Esto no es relevante. Nomas existe para que se pueda generar una SemaphoreProof
+/// recibiendo un Group o una MerkleProof ya generada
 pub enum GroupOrMerkleProof {
     Group(Group),
     MerkleProof(MerkleProof),
@@ -39,12 +41,20 @@ impl GroupOrMerkleProof {
     }
 }
 
+/// Desestructurando una SemaphoreProof
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemaphoreProof {
+    /// Profundidad y raiz del merkle tree
     pub merkle_tree_depth: u16,
     pub merkle_tree_root: BigUint,
+    /// Mensaje asociado a la prueba
     pub message: BigUint,
+    /// Nulificador: Se calcula dentro del witness graph (el circuito)
+    /// Lo que nos importa es que es deterministico a partir de k y scope:
+    /// Nul(k, scope). esto impide la doble señalizacion sin revelar identidad.
+    /// Se pasa como public input para la generacion de la prueba.
     pub nullifier: BigUint,
+    /// scope: numero que indica el motivo del mensaje
     pub scope: BigUint,
     pub points: PackedGroth16Proof,
 }
@@ -105,6 +115,8 @@ impl SemaphoreProof {
 
 pub struct Proof {}
 
+// La prueba se genera para un mensaje emitido en un cierto scope por una identidad dentro de un grupo,
+// cuyo merkle tree asociado tiene cierta altura
 impl Proof {
     pub fn generate_proof(
         identity: Identity,
@@ -132,6 +144,14 @@ impl Proof {
                 merkle_proof_siblings.push(EMPTY_ELEMENT);
             }
         }
+
+        // Inputs de la prueba:
+        // secreto k (privado)
+        // raiz del merkle tree (publico)
+        // longitud de merkle proof (privadisimo LeanIMT)
+        // indices en la merkle proof (privado)
+        // scope (en verdad su hash, publico)
+        // mensaje (en verdad su hash, publico)
 
         let scope_uint = to_big_uint(&scope);
         let message_uint = to_big_uint(&message);
@@ -202,6 +222,10 @@ impl Proof {
         CircomProver::verify(ProofLib::Arkworks, p, zkey_path).unwrap()
     }
 
+    /// La prueba Groth16 son tres puntos de curva [A, B, C]
+    /// esto lo convierte a BigUint separando por coordenada
+    /// G2 esta implementado de modo que son dos BigUint por coordenada
+    /// Esto es util como "serializacion", y esta bueno que este estandarizado
     pub fn pack_groth16_proof(p: circom::Proof) -> PackedGroth16Proof {
         [
             p.a.x,

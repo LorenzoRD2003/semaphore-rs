@@ -39,6 +39,8 @@ pub fn to_element(value: Fq) -> Element {
 }
 
 /// Download zkey from artifacts: https://snark-artifacts.pse.dev/
+/// Esto habria que cambiarlo
+/// Es interesante entrar a la pagina
 pub fn download_zkey(depth: u16) -> Result<String, Box<dyn Error>> {
     let version = "4.13.0";
     let base_url = format!("https://snark-artifacts.pse.dev/semaphore/{version}/");

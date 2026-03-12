@@ -1,6 +1,14 @@
 use circom_prover::graph;
 
+/// Se calcula el witness segun la profundidad del arbol de semaphore
+/// Cada profundidad del arbol corresponde a un circuito distinto. Soporta 1..=32
+/// "Si tu grupo usa profundidad 20, usa el witness generator de profundidad 20"
+/// Una vez que tengamos el witness, podemos hacer la prueba con groth16.
 pub fn dispatch_witness(depth: u16) -> fn(&str) -> anyhow::Result<Vec<u8>> {
+    // Osea termina consiguiendo el witness adecuado: inputs || valores intermedios
+    // cuando compilamos en circom, obtenemos .r1cs y .wasm
+    // En el crate circom-prover, se convierte el circuito en un DAG de operaciones
+    // de computo del circuito.
     match depth {
         1_u16 => {
             graph!(semaphore1, "../witness_graph/semaphore-1.bin");

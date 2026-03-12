@@ -42,6 +42,8 @@ impl LeanIMTHasher<ELEMENT_SIZE> for PoseidonHash {
     }
 }
 
+/// Un grupo es un conjunto de identidades. Se representa como un LeanIMT.
+/// Como se representa de esta forma, puede generar pruebas y verificarlas.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Group {
     /// Hashed LeanIMT
@@ -147,6 +149,8 @@ impl Group {
     }
 
     /// Verifies a proof of membership for a member
+    /// Observamos que aca no hace falta usar self.tree
+    /// Esto es porque la prueba ya incluye la Merkle Root esperada.
     pub fn verify_proof(proof: &MerkleProof) -> bool {
         HashedLeanIMT::<ELEMENT_SIZE, PoseidonHash>::verify_proof(proof)
     }

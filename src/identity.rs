@@ -27,14 +27,17 @@ pub struct Identity {
 
 impl Identity {
     /// Creates a new identity from a private key
+    /// Luego de crearse, una identidad puede firmar mensajes con EdDSA.
     pub fn new(private_key: &[u8]) -> Self {
-        // Hash the private key
+        // Hash the private key -> derivo un escalar secreto k de la clave
         let secret_scalar = Self::gen_secret_scalar(private_key);
 
         // Get the public key by multiplying the secret scalar by the base point
+        // pubkey = kP
         let public_key = PublicKey::from_scalar(&secret_scalar);
 
         // Generate the identity commitment
+        // commitment C = Poseidon(kP)
         let commitment = public_key.commitment();
 
         Self {
@@ -66,6 +69,7 @@ impl Identity {
     }
 
     /// Signs a message
+    /// que algoritmo de firma les hace acordar???
     pub fn sign_message(&self, message: &[u8]) -> Result<Signature, SemaphoreError> {
         if message.len() > 32 {
             return Err(SemaphoreError::MessageSizeExceeded(message.len()));
@@ -115,15 +119,23 @@ impl Identity {
 
     /// Generates the secret scalar from the private key
     fn gen_secret_scalar(private_key: &[u8]) -> Fr {
-        // Hash the private key
+        // Hash the private key -> solo nos va a interesar la segunda mitad del hash
         let mut hash = blake_512(private_key);
+        // escalar s. la funcion devuelve s/8.
 
-        // Prune hash
+        // Prune hash -> le da propiedades utiles al hash
+        // pone en cero los tres bits menos significativos de s
+        // esto hace que s sea multiplo de 8, s = 8k, i.e., del cofactor de Baby Jubjub
+        // quiere decir que sG = k(8G) va a pertenecer al subgrupo primo relevante (no hay puntos "chotos")
+        // pueden leer de "small subgroup atatck"
         hash[0] &= 0xF8;
+        // pone en bit mas alto de s en 0, lo que evita overflows despues
         hash[31] &= 0x7F;
+        // pone el segundo bit mas alto en 1, de modo que 2^254 <= s < 2^255
         hash[31] |= 0x40;
 
         // Use first half of hash and divide by cofactor (equivalent to shifting right by 3 bits)
+        // notemos que teniamos sG = k(8G), entonces esto permite recuperar k
         let shifted: BigInt = BigInt::from_bytes_le(Sign::Plus, &hash[..32]) >> 3;
 
         Fr::from_le_bytes_mod_order(&shifted.to_bytes_le().1)
@@ -189,6 +201,7 @@ impl Signature {
     }
 
     /// Verifies against a public key and message
+    /// Muchachos, a que algoritmo de firma se parece esto???
     pub fn verify(&self, public_key: &PublicKey, message: &[u8]) -> Result<(), SemaphoreError> {
         if message.len() > 32 {
             return Err(SemaphoreError::MessageSizeExceeded(message.len()));
