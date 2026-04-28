@@ -1,5 +1,6 @@
 /target
 /zkey
+/.tools
 .DS_Store
 
 # witness graph

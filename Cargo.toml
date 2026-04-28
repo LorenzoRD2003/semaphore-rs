@@ -13,6 +13,14 @@ readme = "README.md"
 [lib]
 name = "semaphore"
 
+[[bin]]
+name = "identity_signature_low_order_forgery"
+path = "bin/identity_signature_low_order_forgery.rs"
+
+[[bin]]
+name = "semaphore_zero_secret_membership"
+path = "bin/semaphore_zero_secret_membership.rs"
+
 [dependencies]
 blake = "2.0.2"
 light-poseidon = "0.4.0"
