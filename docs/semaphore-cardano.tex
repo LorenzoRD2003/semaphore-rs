@@ -1,0 +1,542 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[spanish]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{graphicx}
+\geometry{margin=1in}
+
+\title{Extensión del Protocolo Semaphore a Cardano sobre BLS12-381}
+\author{}
+\date{}
+
+\begin{document}
+	
+	\maketitle
+	
+	\section{Introducción}
+	
+	Semaphore es un protocolo basado en pruebas de conocimiento cero que permite a un usuario demostrar pertenencia a un conjunto sin revelar su identidad. Este documento describe formalmente su funcionamiento y los desafíos asociados a su migración a Cardano utilizando la curva BLS12-381.
+	
+	\section{¿Qué es Semaphore?}
+	
+	Semaphore \cite{semaphore} es un esquema de señalización anónima basado en zk-SNARKs, específicamente Groth16 \cite{groth16}. Permite demostrar que un usuario pertenece a un conjunto representado como un árbol de Merkle sin revelar cuál elemento específico es.
+	
+	Aplicaciones:
+	\begin{itemize}
+		\item \textbf{MACI} (Minimal Anti-Collusion Infrastructure) \cite{maci}
+		\item Sistemas de votación anónima
+		\item Rate-limiting anónimo
+		\item Autenticación privada
+	\end{itemize}
+	
+	Formalmente, el usuario prueba conocimiento de un witness $w$ tal que:
+	\[
+	(x, w) \in R
+	\]
+	donde $x$ contiene el Merkle root, nullifier y señal.
+	
+	\section{Entidades fundamentales}
+	
+	\subsection{Identidad}
+	
+	En \texttt{semaphore-rs}, una identidad no se modela como el par abstracto
+	\[
+	(\mathsf{trapdoor}, \mathsf{nullifier}),
+	\]
+	sino de manera más concreta como una clave privada en bytes, un escalar secreto derivado de ella, una clave pública sobre Baby Jubjub y un \emph{identity commitment}. Más precisamente, la estructura \texttt{Identity} contiene:
+	\begin{itemize}
+		\item \texttt{private\_key: Vec<u8>},
+		\item \texttt{secret\_scalar: Fr},
+		\item \texttt{public\_key: PublicKey},
+		\item \texttt{commitment: Fq}.
+	\end{itemize}
+	
+	La construcción comienza a partir de una clave privada arbitraria \texttt{private\_key}. Sobre ella se aplica Blake-512 y luego un procedimiento de \emph{pruning} sobre los primeros $32$ bytes del hash. En términos de bits, se fuerzan las condiciones:
+	\begin{itemize}
+		\item los tres bits menos significativos se ponen en $0$;
+		\item el bit más alto se pone en $0$;
+		\item el segundo bit más alto se pone en $1$.
+	\end{itemize}
+	Si llamamos $s \in \{0,1\}^{256}$ al entero resultante \textbf{LUEGO} de ese pruning, entonces el código deriva el escalar secreto como
+	\[
+	k = \left\lfloor \frac{s}{8} \right\rfloor.
+	\]
+	Este valor se interpreta en el cuerpo escalar $\mathbb{F}_r$ de Baby Jubjub y se almacena como \texttt{secret\_scalar}.
+	
+	La clave pública se obtiene como
+	\[
+	A = k(8G),
+	\]
+	donde $8G$ es el generador fijado en \texttt{BabyJubjubConfig::GENERATOR}. Finalmente, el \emph{identity commitment} no es el punto público mismo sino su compresión algebraica mediante Poseidon:
+	\[
+	\mathsf{identityCommitment} = \mathsf{Poseidon}(A_x, A_y).
+	\]
+	
+	Esta decisión de diseño es importante: el commitment que entra al árbol de Merkle es un elemento del cuerpo base y no un punto de curva. Eso simplifica tanto el circuito aritmético como la integración con árboles de Merkle y contratos/verificadores, ya que el árbol almacena hojas escalares y no objetos geométricos completos.
+	
+	\subsection{Grupo}
+	
+	Un grupo en Semaphore es un conjunto de identidades representadas por sus \emph{identity commitments}. En la implementación de \texttt{semaphore-rs}, cada miembro del grupo es un elemento de $32$ bytes correspondiente a:
+	\[
+	\mathsf{leaf} = \mathsf{Poseidon}(A_x, A_y),
+	\]
+	donde $A = k(8G)$ es la clave pública de la identidad.
+	
+	El grupo se implementa como un \emph{Lean Incremental Merkle Tree} (LeanIMT), en el cual tanto hojas como nodos internos tienen tamaño fijo de $32$ bytes. La función de hash utilizada es Poseidon sobre el cuerpo base de BN254, aplicada de a pares:
+	\[
+	H(x,y) = \mathsf{Poseidon}(x,y).
+	\]
+	
+	La raíz del árbol define el estado público del grupo:
+	\[
+	\mathsf{root} = \mathrm{MerkleRoot}(\mathsf{leaf}_1, \dots, \mathsf{leaf}_n).
+	\]
+	
+	Este diseño permite:
+	\begin{itemize}
+		\item inserciones dinámicas de miembros;
+		\item generación eficiente de pruebas de pertenencia;
+		\item verificación de dichas pruebas sin necesidad de acceder al árbol completo.
+	\end{itemize}
+	
+	Una prueba de pertenencia consiste en un Merkle Path que autentica una hoja particular respecto de la raíz. Notablemente, la verificación de la prueba no requiere el estado completo del árbol, ya que la raíz esperada está incluida en la propia prueba.
+	
+	\subsection{Nullifier}
+	
+	En esta implementación, el nullifier se define directamente a partir del escalar secreto de la identidad. Concretamente, el nullifier se define como:
+	\[
+	\mathsf{nullifier} = \mathsf{Poseidon}(\mathsf{scope}, k),
+	\]
+	donde:
+	\begin{itemize}
+		\item $k \in \mathbb{F}_r$ es el escalar secreto de la identidad;
+		\item $\mathsf{scope}$ es un valor público que define el dominio de la prueba (por ejemplo, una votación específica).
+	\end{itemize}
+	
+	Este diseño implica que:
+	\begin{itemize}
+		\item para un mismo $(k, \mathsf{scope})$, el nullifier es único;
+		\item cambiar el \(\mathsf{scope}\) produce un nullifier distinto, incluso para la misma identidad.
+	\end{itemize}
+	
+	Por lo tanto, el nullifier actúa como un identificador determinista de la prueba dentro de un dominio dado, permitiendo detectar reutilizaciones (double-signaling) sin revelar la identidad subyacente.
+	
+	\subsection{Hash pruning y cofactor}
+	
+	El \emph{pruning} aplicado en \texttt{semaphore-rs} sigue la misma filosofía que en esquemas tipo EdDSA sobre curvas de Edwards: forzar que el valor escalar derivado de la clave privada tenga una forma adecuada respecto del cofactor. En Baby Jubjub, el cofactor relevante es $8$. Al limpiar los tres bits menos significativos del hash, el entero resultante $s$ satisface
+	\[
+	s = 8k
+	\]
+	para algún entero $k$. Luego el código divide explícitamente por $8$ y usa $k$ como escalar secreto:
+	\[
+	k = s / 8.
+	\]
+	
+	La consecuencia algebraica es que la clave pública queda
+	\[
+	A = kG = \frac{s}{8}G.
+	\]
+	Equivalentemente, si uno pensara en el escalar ``sin dividir'' $h$, entonces
+	\[
+	sG = k(8G).
+	\]
+	Esto explica por qué conceptualmente aparece la idea de usar $8G$ en lugar de $G$: multiplicar por el cofactor fuerza a trabajar en el subgrupo primo y evita problemas de subgrupos pequeños. En otras palabras, el pruning y la división por el cofactor son dos caras de la misma normalización.
+	
+	En esta implementación concreta, el secreto persistido es $k=s/8$, mientras que en la firma se reconstruye temporalmente el escalar podado $h$ a partir de los primeros $32$ bytes de Blake-512 ya podados, sin la división por $8$. Esa asimetría no es accidental: aparece porque la ecuación de verificación compensa luego multiplicando el desafío por el cofactor.
+	
+	Esto previene ataques de subgrupo pequeño \cite{bernstein2008}.
+	
+	\section{Algoritmo de firma}
+	
+	Semaphore no utiliza una firma Schnorr genérica ni ECDSA. El módulo \texttt{identity.rs} implementa un esquema claramente emparentado con \emph{EdDSA} sobre Baby Jubjub: una curva de Edwards, una clave secreta derivada por hash y pruning, un nonce determinista derivado por hash y una ecuación de verificación de tipo Schnorr/EdDSA.
+	
+	Dado un mensaje $m$ de hasta $32$ bytes, la firma se construye del siguiente modo:
+	\begin{enumerate}
+		\item Se calcula
+		\[
+		H = \mathsf{Blake512}(\mathsf{privateKey}),
+		\]
+		y se aplica pruning sobre los primeros $32$ bytes.
+		\item Se usa la segunda mitad del hash, junto con el mensaje, para derivar determinísticamente el nonce efímero:
+		\[
+		k = \mathsf{Blake512}(H_{32..63} \,\|\, m_{\mathrm{LE}}) \bmod r.
+		\]
+		\item Se calcula el punto efímero
+		\[
+		R = k(8G).
+		\]
+		\item Se computa el desafío con Poseidon:
+		\[
+		c = \mathsf{Poseidon}(R_x, R_y, A_x, A_y, m),
+		\]
+		donde $A$ es la clave pública.
+		\item Se reconstruye el escalar secreto podado \emph{sin} dividir por el cofactor; llamémoslo $h$.
+		\item Finalmente se define
+		\[
+		s = k + c\,h.
+		\]
+	\end{enumerate}
+	
+	La firma es entonces el par
+	\[
+	\sigma = (R,s).
+	\]
+	
+	La verificación chequea la igualdad
+	\[
+	s(8G) = R + cA.
+	\]
+	
+	Por lo tanto, desde el punto de vista estructural, el algoritmo de firma de \texttt{semaphore-rs} es mejor entendido como una variante de EdDSA sobre Baby Jubjub con:
+	\begin{itemize}
+		\item derivación determinista del nonce mediante Blake-512;
+		\item desafío algebraico calculado con Poseidon, en lugar de un hash binario tradicional;
+		\item compensación explícita del cofactor durante la verificación.
+	\end{itemize}
+	
+	\section{Curvas elípticas}
+	
+	En criptografía basada en curvas elípticas es fundamental distinguir entre dos cuerpos finitos distintos asociados a una curva. Por un lado, la curva está definida sobre un \emph{cuerpo base} $\mathbb{F}_q$, que determina las coordenadas de los puntos $(x,y)$ que viven en la curva. Por otro lado, el conjunto de puntos de la curva forma un grupo abeliano finito cuyo orden es $hr$, donde se busca que el cofactor $h$ sea un número pequeño y $r$ sea un primo grande. Las operaciones de multiplicación escalar se realizan con escalares en el \emph{cuerpo escalar} $\mathbb{F}_r$.
+	
+	En sistemas zk-SNARK como Groth16, todas las operaciones dentro del circuito aritmético se realizan sobre un único cuerpo finito, que coincide con el cuerpo base del sistema de prueba (por ejemplo, $\mathbb{F}_{q_{\text{BN254}}}$ en Ethereum). Por esta razón, las operaciones de curvas elípticas que se implementan dentro del circuito deben ser definibles sobre ese mismo cuerpo. En particular, si queremos implementar aritmética de una curva elíptica dentro del circuito, necesitamos que dicha curva esté definida sobre el mismo cuerpo en el que vive el circuito.
+	
+	En la implementación actual de Semaphore sobre BN254, el circuito opera sobre el cuerpo base $\mathbb{F}_{q_{\text{BN254}}}$, y la curva utilizada dentro del circuito (Baby Jubjub) está definida precisamente sobre ese cuerpo. Sin embargo, al migrar a BLS12-381, el cuerpo base del sistema de prueba cambia a $\mathbb{F}_{q_{\text{BLS12-381}}}$. Esto implica que no podemos reutilizar directamente la misma curva interna: necesitamos una curva elíptica definida sobre $\mathbb{F}_{q_{\text{BLS12-381}}}$ para poder implementar las mismas operaciones dentro del circuito.
+	
+	Por esta razón, la migración de BN254 a BLS12-381 no es simplemente un cambio de parámetros en el backend, sino que requiere reemplazar también la curva utilizada dentro del circuito.
+	
+	\subsection{Seguridad}
+	
+	Un aspecto adicional clave en esta migración es el nivel de seguridad criptográfica. La curva BN254 ofrece aproximadamente $100$ bits de seguridad (utilizando un ataque NFS sobre el grupo objetivo del pairing), lo cual hoy se considera en el límite inferior aceptable para aplicaciones modernas (es decir, aún no es posible romperlo hoy en día). En contraste, BLS12-381 ofrece alrededor de $128$ bits de seguridad, alineándose con los estándares actuales.
+	
+	En el contexto de Groth16, este aumento de seguridad implica que romper el sistema requeriría resolver problemas algebraicos significativamente más difíciles. En particular, una ruptura en BN254 podría permitir la generación de pruebas falsas (es decir, demostrar una relación sin conocer un witness válido), mientras que BLS12-381 eleva sustancialmente la dificultad de estos ataques.
+	
+	\subsection{Curvas candidatas}
+	
+	\begin{itemize}
+		\item \textbf{Jubjub} \cite{zcashjubjub}
+		\item \textbf{Bandersnatch} \cite{bandersnatch}
+	\end{itemize}
+	
+	Bandersnatch es una curva de Edwards definida sobre el cuerpo escalar de BLS12-381, optimizada para eficiencia y compatible con endomorfismos GLV.
+	
+	\subsection{Impacto en hash pruning}
+	
+	El cofactor en Jubjub y Bandersnatch es distinto, por lo que debe ajustarse el factor de pruning.
+	
+	\subsection{Parámetros adicionales}
+	
+	\begin{itemize}
+		\item Parámetros de Poseidon deben recalibrarse al nuevo cuerpo
+		\item Número de rondas
+		\item Constantes MDS
+	\end{itemize}
+	
+	\section{Circuito aritmético de Semaphore}
+	
+	El circuito de Semaphore, implementado en \texttt{Circom}, toma como witness privado un escalar secreto ya derivado fuera del circuito, una prueba de pertenencia a un árbol de Merkle binario y dos valores públicos adicionales: un mensaje y un \emph{scope}. Su objetivo es producir dos salidas públicas:
+	\begin{itemize}
+		\item la raíz de Merkle del grupo al que pertenece la identidad;
+		\item un \emph{nullifier} que liga la identidad con el scope y evita reutilizaciones dentro de ese mismo dominio.
+	\end{itemize}
+	
+	La identidad relevante para el circuito queda parametrizada por un único escalar secreto
+	\[
+	s \in \mathbb{F}_r,
+	\]
+	donde \(r\) es el orden del subgrupo primo de Baby Jubjub. Ese escalar no es una clave privada binaria arbitraria: es el resultado del procedimiento de derivación y pruning implementado en \texttt{semaphore-rs}. En particular, el circuito no recibe la clave privada original, sino directamente el escalar secreto ya normalizado.
+	
+	\subsection{Entradas y salidas}
+	
+	El circuito \texttt{Semaphore(MAX\_DEPTH)} recibe las siguientes señales de entrada:
+	\begin{itemize}
+		\item \texttt{secret}: escalar secreto de la identidad;
+		\item \texttt{merkleProofLength}: longitud efectiva del Merkle Path;
+		\item \texttt{merkleProofIndex}: índice de la hoja dentro del árbol;
+		\item \texttt{merkleProofSiblings[0..MAX\_DEPTH-1]}: nodos hermanos del Merkle Path;
+		\item \texttt{message}: hash del mensaje que se desea asociar a la prueba;
+		\item \texttt{scope}: hash del dominio respecto del cual se computa el nullifier.
+	\end{itemize}
+	
+	Las salidas del circuito, y por lo tanto sus valores públicos, son:
+	\begin{itemize}
+		\item \texttt{merkleRoot};
+		\item \texttt{nullifier}.
+	\end{itemize}
+	
+	Además, en la interfaz del sistema Groth16, también deben considerarse públicos aquellos valores que el verificador externo fija o interpreta como parte de la instancia. En particular, aunque \texttt{message} y \texttt{scope} aparezcan como \texttt{signal input} en Circom, conceptualmente forman parte de la instancia pública del protocolo: el mensaje porque es el contenido asociado a la señal anónima, y el scope porque determina el dominio de unicidad del nullifier. En otras palabras, desde el punto de vista criptográfico, los valores relevantes de la instancia pública son
+	\[
+	(\mathsf{merkleRoot},\mathsf{nullifier},\mathsf{message},\mathsf{scope}).
+	\]
+	
+	\subsection{Generación de la identidad dentro del circuito}
+	
+	La primera parte del circuito reconstruye la clave pública de la identidad a partir del escalar secreto. Sea \(8G\) el generador efectivo usado por la implementación de Baby Jubjub. Como vimos antes al analizar el código Rust, dicho generador no es el punto \(G\) del grupo total de EIP-2494, sino el punto que ya pertenece al subgrupo primo de orden \(r\). Por lo tanto, la clave pública derivada dentro del circuito es
+	\[
+	A = k(8G).
+	\]
+	
+	En el código Circom esto se implementa mediante el componente \texttt{BabyPbk()}, que devuelve las coordenadas afines \((A_x,A_y)\) del punto público. Luego se define el \emph{identity commitment} como
+	\[
+	\mathsf{identityCommitment} = \mathsf{Poseidon}(A_x,A_y).
+	\]
+	
+	En consecuencia, la pertenencia al grupo no consiste en demostrar que la clave pública está en el árbol, sino que el commitment escalar derivado de esa clave pública está autenticado por el Merkle Path provisto.
+	
+	\subsection{Restricción de rango sobre el secreto}
+	
+	Antes de derivar la clave pública, el circuito impone que el secreto pertenezca al rango correcto. Si \(r\) denota el orden del subgrupo primo de Baby Jubjub, el circuito verifica:
+	\[
+	0 \le k < r.
+	\]
+	Esto se implementa con el comparador:
+	\[
+	\texttt{LessThan(251)}.
+	\]
+	
+	La intención algebraica es garantizar que el escalar secreto represente un elemento válido del cuerpo´ escalar asociado al subgrupo primo.
+	
+	\subsection{Verificación de pertenencia al grupo}
+	
+	La segunda parte del circuito verifica que la identidad pertenece al grupo Semaphore representado por un árbol de Merkle binario. La hoja cuya pertenencia se prueba es precisamente
+	\[
+	\mathsf{leaf} = \mathsf{identityCommitment}.
+	\]
+	
+	A partir de la longitud de la prueba, el índice de la hoja y el arreglo de hermanos, el componente \texttt{BinaryMerkleRoot(MAX\_DEPTH)} reconstruye la raíz:
+	\[
+	\mathsf{merkleRoot} =
+	\mathrm{MerkleRoot}\bigl(\mathsf{identityCommitment}, \mathsf{merkleProofLength}, \mathsf{merkleProofIndex}, \mathsf{merkleProofSiblings}\bigr).
+	\]
+	
+	La salida pública \texttt{merkleRoot} es entonces exactamente la raíz del árbol calculada dentro del circuito. Así, el conocimiento del witness demuestra que existe una hoja comprometida con la identidad reconstruida a partir del secreto y que esa hoja pertenece al grupo cuyo root se publica en la instancia.
+	
+	En términos lógicos, esta parte del circuito prueba la siguiente afirmación:
+	\[
+	\exists k,\pi_{\mathrm{Merkle}}
+	\quad\text{tal que}\quad
+	\mathsf{leaf}=\mathsf{Poseidon}(A_x,A_y),\;
+	A=k(8G)',\;
+	\mathrm{VerifyMerklePath}(\mathsf{leaf},\pi_{\mathrm{Merkle}})=\mathsf{merkleRoot}.
+	\]
+	
+	\subsection{Generación del nullifier}
+	
+	La tercera parte del circuito genera el \emph{nullifier}, que sirve para impedir que una misma identidad produzca múltiples pruebas válidas dentro de un mismo scope. En esta implementación, el nullifier se define como
+	\[
+	\mathsf{nullifier} = \mathsf{Poseidon}(\mathsf{scope}, k).
+	\]
+	
+	Es importante notar que aquí el nullifier no se calcula a partir de una componente secreta separada llamada ``nullifier'' ni a partir de la clave pública, sino directamente a partir del escalar secreto \(k\) y del scope público. Por lo tanto, la unicidad dentro de un scope queda ligada a ese escalar secreto concreto.
+	
+	Esta construcción tiene la siguiente propiedad fundamental:
+	\begin{itemize}
+		\item si una misma identidad usa dos veces el mismo \(\mathsf{scope}\), el nullifier será el mismo;
+		\item si cambia el \(\mathsf{scope}\), el nullifier cambia.
+	\end{itemize}
+	
+	En consecuencia, el protocolo permite reutilizar la misma identidad en distintos contextos sin linkear externamente esas acciones, pero impide reutilizaciones dentro de un mismo dominio de aplicación, como una votación, una encuesta o un sistema de rate limiting.
+	
+	\subsection{El rol del mensaje}
+	
+	El mensaje \texttt{message} no interviene en la derivación de la identidad, ni en la verificación de la pertenencia al árbol, ni en la generación del nullifier. En el circuito aparece únicamente a través de la restricción
+	\[
+	\texttt{dummySquare} = \texttt{message} \cdot \texttt{message}.
+	\]
+	
+	La razón de esta aparente redundancia es técnica: en sistemas Groth16, una entrada pública que no participa en ninguna restricción puede volverse maleable desde el punto de vista de la instancia. Forzar una restricción trivial sobre el mensaje asegura que el compilador lo incorpore efectivamente al sistema R1CS, de modo que el valor del mensaje quede ligado a la prueba.
+	
+	Dicho de otra manera, aunque el mensaje no afecta la semántica de pertenencia ni la del nullifier, sí queda criptográficamente comprometido por la prueba generada.
+	
+	\subsection{Descripción algebraica de la relación}
+	
+	La relación NP probada por el circuito puede expresarse del siguiente modo. Dados como valores públicos
+	\[
+	x = (\mathsf{merkleRoot}, \mathsf{nullifier}, \mathsf{message}, \mathsf{scope}),
+	\]
+	el prover demuestra conocimiento de un witness
+	\[
+	w = (k,\mathsf{merkleProofLength},\mathsf{merkleProofIndex},\mathsf{merkleProofSiblings})
+	\]
+	tal que se satisfacen simultáneamente las siguientes condiciones:
+	\begin{align*}
+		& 0 \le k < r, \\
+		& A = k(8G), \\
+		& \mathsf{identityCommitment} = \mathsf{Poseidon}(A_x,A_y), \\
+		& \mathsf{merkleRoot} =
+		\mathrm{MerkleRoot}\bigl(\mathsf{identityCommitment},\mathsf{merkleProofLength},\mathsf{merkleProofIndex},\mathsf{merkleProofSiblings}\bigr), \\
+		& \mathsf{nullifier} = \mathsf{Poseidon}(\mathsf{scope}, k), \\
+		& \exists z \text{ tal que } z = \mathsf{message}^2.
+	\end{align*}
+	
+	La última línea no agrega contenido semántico relevante sobre el mensaje; sólo asegura que dicho valor quede efectivamente ligado a la instancia del sistema de restricciones.
+	
+	\subsection{Interpretación conceptual}
+	
+	Con esta formulación, una prueba válida de Semaphore certifica exactamente lo siguiente:
+	
+	\begin{quote}
+		``Conozco un escalar secreto \(s\) que determina una clave pública \(A=sG'\), cuyo commitment pertenece al árbol de Merkle con raíz \(\mathsf{merkleRoot}\). Además, el nullifier publicado fue correctamente calculado como \(\mathsf{Poseidon}(\mathsf{scope},k)\), y la prueba está ligada al mensaje público \(\mathsf{message}\).''
+	\end{quote}
+	
+	Por eso Semaphore implementa una señal anónima autenticada por pertenencia a grupo: el verificador aprende que el emisor pertenece al conjunto autorizado, pero no cuál miembro concreto del conjunto produjo la prueba.
+	
+	\subsection{Consecuencia para una migración a otra curva}
+	
+	Esta descripción del circuito también deja claro qué partes dependen de la curva subyacente. Cambiar Baby Jubjub por otra curva sobre el cuerpo escalar de BLS12-381 implica modificar al menos:
+	\begin{itemize}
+		\item la multiplicación escalar que se implementa sobre $G$, que depende del cofactor de la curva.
+		\item la elección del generador efectivo del subgrupo primo;
+		\item las reglas de derivación externa del escalar secreto;
+		\item y, potencialmente, las constantes y parámetros del hash Poseidon sobre el nuevo cuerpo.
+	\end{itemize}
+	
+	En particular, no basta con reemplazar la curva en la aritmética del backend: el circuito mismo codifica explícitamente cómo se deriva la clave pública a partir del secreto, y esa derivación depende de la estructura de subgrupos y del generador elegido en la curva concreta.
+	
+	\section{Endomorfismo GLV}
+	
+	Sea $\phi$ un endomorfismo eficiente sobre la curva tal que existe un escalar $\lambda \in \mathbb{F}_r$ con:
+	\[
+	\phi(P) = \lambda P.
+	\]
+	Si para cualquier escalar $k \in \mathbb{F}_r$ se puede escribir:
+	\[
+	k = k_1 + \lambda k_2,
+	\]
+	entonces tendremos:
+	\[
+	kP = k_1 P + k_2 \phi(P).
+	\]
+	
+	Esta descomposición permite reemplazar una multiplicación escalar de tamaño completo por dos multiplicaciones con escalares aproximadamente de la mitad de tamaño, lo que reduce significativamente el costo computacional.
+	
+	Bandersnatch soporta un endomorfismo GLV eficiente \cite{bandersnatch}, lo que la vuelve particularmente atractiva para optimizar operaciones de \emph{multi-scalar multiplication} (MSM).
+	
+	\subsection{Impacto en MSM y algoritmo de Pippenger}
+	
+	En el contexto de zk-SNARKs como Groth16, el costo dominante del \emph{proving} está dado por operaciones de MSM:
+	\[
+	\sum_{i=1}^n s_i P_i.
+	\]
+	
+	El algoritmo de Pippenger organiza esta suma agrupando los escalares en ventanas (windows) de bits y acumulando contribuciones en \emph{buckets}. Su complejidad depende esencialmente de:
+	\begin{itemize}
+		\item el número de puntos $n$;
+		\item el tamaño en bits de los escalares $s_i$.
+	\end{itemize}
+	
+	El uso del endomorfismo GLV transforma la MSM original:
+	\[
+	\sum_{i=1}^n s_i P_i
+	\]
+	en:
+	\[
+	\sum_{i=1}^n \left( s_{i,1} P_i + s_{i,2} \phi(P_i) \right),
+	\]
+	donde cada escalar se descompone como:
+	\[
+	s_i = s_{i,1} + \lambda s_{i,2}.
+	\]
+	
+	Esto equivale a una MSM sobre $2n$ puntos:
+	\[
+	\sum_{i=1}^n s_{i,1} P_i + \sum_{i=1}^n s_{i,2} \phi(P_i),
+	\]
+	pero con escalares $s_{i,1}, s_{i,2}$ de aproximadamente la mitad de bits.
+	
+	Desde el punto de vista de Pippenger:
+	\begin{itemize}
+		\item se duplican los puntos (se agregan $\phi(P_i)$);
+		\item pero se reduce el número de ventanas necesarias, ya que los escalares son más cortos;
+		\item se mejora la densidad de los buckets y se reduce el número total de operaciones de suma.
+	\end{itemize}
+	
+	En la práctica, esta transformación reduce el costo total de la MSM, que es el principal cuello de botella del proving. Por lo tanto, la implementación de GLV impacta directamente en el rendimiento del sistema.
+	
+	\subsection{Desafíos en Rust}
+	
+	\begin{itemize}
+		\item Implementación constante en tiempo del endomorfismo $\phi$ y de la descomposición escalar.
+		\item Integración eficiente con implementaciones existentes de MSM (por ejemplo, Pippenger en la biblioteca Arkworks).
+		\item Representación eficiente de $\phi(P)$ sin incurrir en costos adicionales significativos de conversión o serialización.
+	\end{itemize}
+	
+	\section{LeanIMT}
+	
+	Lean Incremental Merkle Tree (LeanIMT) es una estructura optimizada para inserciones dinámicas \cite{leanimt}. Reduce almacenamiento manteniendo complejidad logarítmica.
+	
+	\section{Validadores en Cardano}
+	
+	\subsection{Arquitectura}
+	
+	Se propone:
+	
+	\begin{itemize}
+		\item \textbf{State Validator}: mantiene el estado del grupo en un UTXO con una representación concisa de lo necesario del LeanIMT. Esto puede incluir Merkle Root viejas. Cada función de Solidity se mapea a un caso del \texttt{redeemer} de Aiken. En particular, la función \texttt{createGroup} se mapea a un \texttt{mint} del UTXO en Aiken.
+		\item \textbf{Proof Validator}: verifica pruebas zk. Recibe como reference input el UTXO de un grupo. Emite nullifiers y los acumula en un datum (hay que ver bien cómo hacer esto).
+	\end{itemize}
+	
+	\subsection{Problema de nullifiers}
+	
+	El conjunto de nullifiers crece linealmente. Falta plantear una solución (puede ir por el lado de acumuladores), pero hay  que investigar más.
+	
+	\section{Trusted Setup}
+	
+	El cambio de circuito implica generar nuevos parámetros para la CRS de Groth16. Debemos hacer una ceremonia MPC de Powers of Tau nueva e integrarla en la página del PSE \cite{powersoftau}.
+	
+	\section{Resumen}
+	
+	\subsection{Cosas a hacer}
+	
+	\begin{itemize}
+		\item Circuito zk
+		\item Trusted Setup
+		\item Implementación criptográfica
+		\item Validadores Aiken
+	\end{itemize}
+	
+	\subsection{Estimación}
+	
+	\begin{itemize}
+		\item Tiempo: 3 meses
+		\item Grant Cardano: 250K USD
+		\item Grant Ethereum: 100K USD
+	\end{itemize}
+	
+	\begin{thebibliography}{9}
+		
+		\bibitem{semaphore}
+		Semaphore Protocol, \url{https://docs.semaphore.pse.dev/}
+		
+		\bibitem{groth16}
+		J. Groth. "On the Size of Pairing-based Non-interactive Arguments". EUROCRYPT 2016.
+		
+		\bibitem{poseidon}
+		L. Grassi et al. "Poseidon: A New Hash Function for Zero-Knowledge Proof Systems". 2019.
+		
+		\bibitem{bls12}
+		S. Bowe. "BLS12-381: New zk-SNARK Elliptic Curve Construction".
+		
+		\bibitem{zcashjubjub}
+		Zcash Protocol Specification.
+		
+		\bibitem{bandersnatch}
+		Bowe, Grigg, Hopwood. "Bandersnatch: a fast elliptic curve built over the BLS12-381 scalar field".
+		
+		\bibitem{bernstein2008}
+		D. Bernstein et al. "Twisted Edwards Curves".
+		
+		\bibitem{leanimt}
+		Lean Incremental Merkle Tree, \url{https://github.com/privacy-scaling-explorations/zk-kit}
+		
+		\bibitem{powersoftau}
+		Powers of Tau Ceremony, \url{https://github.com/privacy-scaling-explorations}
+		
+		\bibitem{maci}
+		Minimal Anti-Collusion Infrastructure (MACI)
+		
+	\end{thebibliography}
+	
+\end{document}

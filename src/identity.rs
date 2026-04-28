@@ -43,7 +43,7 @@ impl Identity {
         Self {
             private_key: private_key.to_vec(),
             secret_scalar,
-            public_key,
+            public_key, 
             commitment,
         }
     }

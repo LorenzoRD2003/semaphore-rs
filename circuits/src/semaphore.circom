@@ -30,7 +30,6 @@ template Semaphore(MAX_DEPTH) {
     signal input merkleProofLength, merkleProofIndex, merkleProofSiblings[MAX_DEPTH];
     signal input message;
     signal input scope;
-
     // Output signals.
     // The output signals are all public.
     signal output merkleRoot, nullifier;

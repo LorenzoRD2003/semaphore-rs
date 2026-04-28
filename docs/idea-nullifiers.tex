@@ -1,0 +1,189 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage[spanish]{babel}
+\usepackage{hyperref}
+
+\title{Registro Shardeado de Nullifiers para Semaphore en Cardano}
+\author{}
+\date{}
+
+\begin{document}
+	
+	\maketitle
+	
+	\section{Introducción}
+	
+	En el proceso de portar Semaphore a Cardano, uno de los problemas fundamentales es la correcta gestión de los \textit{nullifiers}. En implementaciones sobre Ethereum, los nullifiers se almacenan en el estado del contrato para prevenir el doble uso. Sin embargo, en el modelo eUTxO de Cardano no existe un estado global mutable, por lo que esta garantía debe lograrse mediante \textbf{transiciones de estado explícitas}.
+	
+	Este documento presenta un diseño basado en \textbf{buckets shardeados}, que permite implementar un registro de nullifiers eficiente, escalable y alineado con el modelo eUTxO.
+	
+	\section{Definición de Nullifier}
+	
+	En el diseño actual, el nullifier se define como:
+	
+	$$n = \operatorname{Poseidon}(\texttt{identityCommitment}, \texttt{scope})$$
+	
+	Esto implica:
+	
+	\begin{itemize}
+		\item Para un \texttt{scope} fijo, cada identidad genera un único nullifier.
+		\item Reutilizar la misma identidad en el mismo scope produce el mismo nullifier.
+	\end{itemize}
+	
+	Por lo tanto, evitar el doble uso equivale a garantizar que cada nullifier se utilice como máximo una vez.
+	
+	\section{Problema}
+	
+	Se desea imponer el siguiente invariante:
+	
+	\begin{quote}
+		Un nullifier $n$ sólo puede ser utilizado en una prueba válida si no ha sido utilizado previamente.
+	\end{quote}
+	
+	En Ethereum esto se logra mediante almacenamiento de los nullifiers en contrato (usando su famoso Patricia Merkle Trie). En Cardano, esto se implementa forzando una transición de estado que registre el nullifier en el datum de algún UTXO. Una posible solución es usar un Merkle Tree y solamente actualizar onchain la raíz.
+	
+	Sin embargo, la solución anterior tiene una desventaja respecto a Ethereum, que es que no tenemos \textit{data availability}. Por lo tanto, proponemos un nuevo diseño para solucionar este problema.
+	
+	\section{Diseño con Buckets Shardeados}
+	
+	\subsection{Idea general}
+	
+	Se divide el conjunto global de nullifiers en $N = 2^k$ buckets:
+	
+	$$\mathcal{N} = \bigcup_{i=0}^{N-1} \mathcal{N}_i$$
+	
+	Cada bucket está representado onchain por un UTxO independiente.
+	
+	\subsection{Asignación de bucket}
+	
+	Cada nullifier se asigna de forma determinística:
+	
+	$$\text{bucket}(n) = n \bmod N$$
+	
+	Dado que $n$ se obtiene como output de la función de hash Poseidon, en el ROM podemos asumir una distribución uniforme para $n$.
+	
+	\subsection{Estado de un bucket}
+	
+	El validador ya va a tener como parámetro el valor de $k$. Cada bucket contiene:
+	
+	\begin{itemize}
+		\item \texttt{groupIdentifier: Int}
+		\item \texttt{bucketIdentifier: Int}, con $0 \leq \texttt{bucketIdentifier} < N$.
+		\item \texttt{nullifiers: List<Bytes>}
+	\end{itemize}
+	
+	\subsection{Transición de estado}
+	
+	Para un bucket $\mathcal{N}_b$, la transición es:
+	
+	$$\mathcal{N}_b' = \mathcal{N}_b \cup {n}$$
+		
+	con la precondición:
+	
+	$$n \notin \mathcal{N}_b$$
+	
+	\section{Rol del Validador de Proof}
+	
+	El \texttt{ProofValidator} debe garantizar:
+	
+	\begin{enumerate}
+		\item La prueba zk es válida.
+		\item El nullifier $n$ es consistente con los inputs públicos.
+		\item Se consume el bucket correcto $b = \text{bucket}(n)$.
+		\item $n$ no está previamente en el $b$.
+		\item El bucket de salida contiene exactamente el estado previo más $n$.
+	\end{enumerate}
+	
+	Esto acopla la verificación criptográfica con la transición de estado.
+	
+	\section{Correctitud}
+	
+	\subsection{Determinismo}
+	
+	Cada nullifier pertenece a un único bucket.
+	
+	\subsection{Exclusividad de UTxO}
+	
+	Dado que un UTxO sólo puede consumirse una vez:
+	
+	\begin{itemize}
+		\item no pueden existir dos actualizaciones simultáneas exitosas sobre el mismo bucket,
+		\item un segundo intento detectará el nullifier ya registrado.
+	\end{itemize}
+	
+	Esto garantiza la no reutilización.
+	
+	\section{Relación con Bases de Datos}
+	
+	Este diseño es equivalente a un conjunto distribuido particionado por hash con inserción condicional. Conceptualmente:
+	
+	\begin{verbatim}
+		INSERT INTO nullifiers(n)
+		IF NOT EXISTS
+	\end{verbatim}
+	
+	Donde:
+	
+	\begin{itemize}
+		\item cada bucket es una partición,
+		\item cada UTxO es un shard.
+	\end{itemize}
+	
+	\section{Modelo de Optimización}
+	
+	Sea:
+	
+	\begin{itemize}
+		\item $M$: cantidad total esperada de nullifiers
+		\item $N = 2^k$: cantidad de buckets
+		\item $\lambda = M/N$: carga esperada por bucket
+	\end{itemize}
+	
+	Se define la función de costo (a minimizar):
+	
+	$$C(k) = \alpha N + \beta \lambda + \gamma \lambda^2$$
+	
+	donde los siguientes parámetros habrá que pensar cómo construirlos:
+	
+	\begin{itemize}
+		\item $\alpha$: costo estructural (cantidad de buckets).
+		\item $\beta$: costo de búsqueda en el bucket.
+		\item $\gamma$: costo de contención, modela el costo esperado de colisiones concurrentes en un bucket.
+	\end{itemize}
+	
+	Si hay $T$ transacciones simultánead, la probabilidad de que dos caigan en el mismo bucket crece con $\lambda^2 = \left(\frac{M}{N}\right)^2$ (bolitas en cajitas). Cuando dos tx quieren el mismo bucket, una falla o se retrasa, y de alguna forma habría que modelarlo en $C$.
+	
+	\subsection{Restricción}
+	
+	$$\lambda \leq L,$$
+	
+	donde $L$ es el tamaño máximo aceptable de bucket. Este valor probablemente lo podamos calcular.
+	
+	\subsection{Recomendación Práctica}
+	
+	Podemos usar $k, = 8, N = 256$ como valores iniciales. Si vemos que en la práctica no se porta bien, nos ponemos a estimar $\alpha, \beta, \gamma$. En cualquier caso, $k$ es un parámetro que va a recibir \texttt{ProofValidator} en Aiken así que cada aplicación puede adaptarlo a su conveniencia.
+	
+	\section{Inicialización}
+	
+	Se recomienda usar \textbf{lazy initialization}:
+	
+	\begin{itemize}
+		\item los buckets se crean al primer uso
+		\item se evita un alto costo inicial
+		\item el costo se distribuye entre usuarios
+	\end{itemize}
+	
+	\subsection{Costos}
+	
+	\begin{itemize}
+		\item cada bucket: $\sim$1--2 ADA
+		\item inicialización completa (256): $\sim$260--500 ADA
+		\item lazy: costo inicial mínimo
+	\end{itemize}
+	
+	\section{Conclusión}
+	
+	El enfoque de buckets shardeados permite implementar correctamente la unicidad de nullifiers en Cardano respetando el modelo UTXO. Además, ofrece buena escalabilidad, paralelismo y una correspondencia clara con sistemas distribuidos modernos.
+	
+\end{document}
